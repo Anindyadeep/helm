@@ -1,5 +1,5 @@
 import random
-from abc import ABC
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import replace
 from itertools import cycle
@@ -19,6 +19,15 @@ class InContextLearningAdapter(Adapter, ABC):
     An `Adapter`, guided by the `AdapterSpec`, takes a `Scenario` and produces
     a `ScenarioState`. It has additional logic surrounding in-context examples.
     """
+
+    @abstractmethod
+    def generate_requests(
+        self, eval_instance: Instance, train_trial_index: int, training_instances: List[Instance]
+    ) -> List[RequestState]:
+        """
+        Given a validation or test `Instance`, generates one or more `RequestState`s.
+        """
+        pass
 
     @htrack(None)
     def adapt(self, instances: List[Instance], parallelism: int) -> ScenarioState:
@@ -64,15 +73,18 @@ class InContextLearningAdapter(Adapter, ABC):
         eval_instances: List[Instance],
         parallelism: int,
     ) -> List[RequestState]:
-        self.train_trial_index: int = train_trial_index
-        self.train_instances: List[Instance] = self.sample_examples(
+        training_instances: List[Instance] = self.sample_examples(
             all_train_instances, seed=train_trial_index, sample_train=self.adapter_spec.sample_train
         )
-        hlog(f"Sampled {len(self.train_instances)} examples for trial #{self.train_trial_index}.")
+        hlog(f"Sampled {len(training_instances)} examples for trial #{train_trial_index}.")
+
+        def generate_requests_for_training_trial(eval_instance: Instance):
+            """Bind some local variables before parallelizing."""
+            return self.generate_requests(eval_instance, train_trial_index, training_instances)
 
         # Generate request_states
         results: List[List[RequestState]] = parallel_map(
-            self.generate_requests,
+            generate_requests_for_training_trial,
             eval_instances,
             parallelism=parallelism,
         )
@@ -89,10 +101,6 @@ class InContextLearningAdapter(Adapter, ABC):
                             hlog(line)
 
         # Flatten and return
-        all_request_states: List[RequestState] = []
-        for result_index, result in enumerate(results):
-            all_request_states.extend(result)
-
         return [request_state for result in results for request_state in result]
 
     def sample_examples(
@@ -206,6 +214,7 @@ class InContextLearningAdapter(Adapter, ABC):
         # Prompt
         prompt = Prompt(
             global_prefix=self.adapter_spec.global_prefix,
+            global_suffix=self.adapter_spec.global_suffix,
             instructions_block=instructions_block,
             train_instance_blocks=train_instance_blocks,
             eval_instance_block=eval_instance_block,
@@ -224,16 +233,28 @@ class InContextLearningAdapter(Adapter, ABC):
         # Input
         result: str = self.adapter_spec.input_prefix + (instance.input.text or "") + self.adapter_spec.input_suffix
 
-        # References (optionally) and output
-        output: str
+        if include_output:
+            output: str = self.construct_output(instance, reference_index)
+            result += self.adapter_spec.output_prefix + output + self.adapter_spec.output_suffix
+        else:
+            result += self.adapter_spec.output_prefix.rstrip()
 
-        delimiter = ", "
-        no_correct_references = "n/a"
+        return result
+
+    def construct_output(self, instance: Instance, reference_index: Optional[int]) -> str:
+        """
+        Returns the gold output text constructed from correct references.
+        If `multi_label` of `AdapterSpec` is true, all correct references are included.
+        """
+        delimiter: str = ", "
+        no_correct_references: str = "n/a"
+
+        output: str
         if reference_index is not None:
             reference = instance.references[reference_index]
             output = reference.output.text
-            # Put only the correct reference as the output
         elif self.adapter_spec.multi_label:
+            # Put only the correct references as part as the output
             correct_references: List[Reference] = instance.all_correct_references
             if not correct_references:
                 output = no_correct_references
@@ -245,13 +266,7 @@ class InContextLearningAdapter(Adapter, ABC):
                 output = no_correct_references
             else:
                 output = first_correct_reference.output.text
-
-        if include_output:
-            result += self.adapter_spec.output_prefix + output + self.adapter_spec.output_suffix
-        else:
-            result += self.adapter_spec.output_prefix.rstrip()
-
-        return result
+        return output
 
     def _make_prompt_fit(self, prompt: Prompt) -> Prompt:
         """

@@ -22,10 +22,12 @@ from typing import List, Optional, Dict, Any, Tuple, Set
 
 from tqdm import tqdm
 
+from helm.benchmark.model_metadata_registry import get_default_model_metadata
 from helm.common.general import (
     write,
     ensure_directory_exists,
     asdict_without_nones,
+    serialize_dates,
     parallel_map,
     singleton,
     unique_simplification,
@@ -45,7 +47,7 @@ from helm.benchmark.presentation.schema import (
     MetricNameMatcher,
     RunGroup,
     read_schema,
-    SCHEMA_YAML_FILENAME,
+    SCHEMA_CLASSIC_YAML_FILENAME,
     BY_GROUP,
     THIS_GROUP_ONLY,
     NO_GROUPS,
@@ -57,7 +59,10 @@ from helm.benchmark.presentation.contamination import (
     CONTAMINATION_STYLES,
     CONTAMINATION_LEVEL_STRONG,
 )
+from helm.benchmark.config_registry import register_helm_configurations
 from helm.benchmark.presentation.run_display import write_run_display_json
+from helm.benchmark.model_deployment_registry import get_metadata_for_deployment
+from helm.benchmark.model_metadata_registry import ModelMetadata
 
 
 OVERLAP_N_COUNT = 13
@@ -165,7 +170,7 @@ def get_coarse_adapter_spec(
 
     # Create a new adapter_spec, keeping only the model and the keys in adapter_keys_shown
     adapter_spec_kwargs = {key: adapter_spec.__dict__[key] for key in adapter_keys_shown}
-    return AdapterSpec(**adapter_spec_kwargs)  # type: ignore
+    return AdapterSpec(**adapter_spec_kwargs)
 
 
 def get_method_display_name(model_display_name: Optional[str], info: Dict[str, Any]) -> str:
@@ -178,6 +183,8 @@ def get_method_display_name(model_display_name: Optional[str], info: Dict[str, A
     info = dict(info)
     if "model" in info:
         del info["model"]
+    if "model_deployment" in info:
+        del info["model_deployment"]
 
     return (model_display_name or "???") + (f" [{dict_to_str(info)}]" if len(info) > 0 else "")
 
@@ -270,9 +277,11 @@ class Summarizer:
         release: Optional[str],
         suites: Optional[List[str]],
         suite: Optional[str],
+        schema_file: str,
         output_path: str,
         verbose: bool,
         num_threads: int,
+        allow_unknown_models: bool,
     ):
         """
         A note on the relation between `release`, `suites`, and `suite`:
@@ -288,6 +297,7 @@ class Summarizer:
         self.suites: List[str]
         self.run_suite_paths: List[str]
         self.suite: Optional[str] = None
+        self.schema_file = schema_file
         self.release: Optional[str] = None
         if suite:
             self.suite = suite
@@ -301,10 +311,11 @@ class Summarizer:
             self.run_suite_paths = [os.path.join(output_path, "runs", suite) for suite in suites]
         self.verbose: bool = verbose
         self.num_threads: int = num_threads
+        self.allow_unknown_models: bool = allow_unknown_models
 
         ensure_directory_exists(self.run_release_path)
 
-        self.schema = read_schema()
+        self.schema = read_schema(schema_file)
         self.contamination = read_contamination()
         validate_contamination(self.contamination, self.schema)
 
@@ -334,7 +345,7 @@ class Summarizer:
                 if run_group_name not in self.schema.name_to_run_group:
                     hlog(
                         f"WARNING: group {run_group_name} mentioned in run spec {run.run_spec.name} "
-                        f"but undefined in {SCHEMA_YAML_FILENAME}, skipping"
+                        f"but undefined in {self.schema_file}, skipping"
                     )
                     continue
                 run_group = self.schema.name_to_run_group[run_group_name]
@@ -355,7 +366,13 @@ class Summarizer:
         """Load the runs in the run suite path."""
         # run_suite_path can contain subdirectories that are not runs (e.g. eval_cache, groups)
         # so filter them out.
-        run_dir_names = sorted([p for p in os.listdir(run_suite_path) if p != "eval_cache" and p != "groups"])
+        run_dir_names = sorted(
+            [
+                p
+                for p in os.listdir(run_suite_path)
+                if p != "eval_cache" and p != "groups" and os.path.isdir(os.path.join(run_suite_path, p))
+            ]
+        )
         for run_dir_name in tqdm(run_dir_names, disable=None):
             run_spec_path: str = os.path.join(run_suite_path, run_dir_name, "run_spec.json")
             stats_path: str = os.path.join(run_suite_path, run_dir_name, "stats.json")
@@ -363,13 +380,8 @@ class Summarizer:
                 hlog(f"WARNING: {run_dir_name} doesn't have run_spec.json or stats.json, skipping")
                 continue
             run_path: str = os.path.join(run_suite_path, run_dir_name)
-            self.runs.append(self.read_run(run_path))
-
-        # For each group (e.g., natural_qa), map
-        # (i) scenario spec (e.g., subject=philosophy) [optional] and
-        # (ii) adapter spec (e.g., model = openai/davinci)
-        # to list of runs
-        for run in self.runs:
+            run = self.read_run(run_path)
+            self.runs.append(run)
             if run.run_spec.name in self.runs_to_run_suites:
                 hlog(
                     f"WARNING: Run entry {run.run_spec.name} is present in two different Run Suites. "
@@ -377,11 +389,24 @@ class Summarizer:
                 )
             self.runs_to_run_suites[run.run_spec.name] = suite
 
+    def group_runs(self):
+        # For each group (e.g., natural_qa), map
+        # (i) scenario spec (e.g., subject=philosophy) [optional] and
+        # (ii) adapter spec (e.g., model = openai/davinci)
+        # to list of runs
+        for run in self.runs:
             scenario_spec = run.run_spec.scenario_spec
             adapter_spec = run.run_spec.adapter_spec
             for group_name in run.run_spec.groups:
                 self.group_adapter_to_runs[group_name][adapter_spec].append(run)
                 self.group_scenario_adapter_to_runs[group_name][scenario_spec][adapter_spec].append(run)
+
+    def write_schema(self):
+        """Write the schema file to benchmark_output so the frontend knows about it."""
+        write(
+            os.path.join(self.run_release_path, "schema.json"),
+            json.dumps(asdict_without_nones(self.schema), indent=2, default=serialize_dates),
+        )
 
     def read_runs(self):
         self.runs: List[Run] = []
@@ -537,7 +562,7 @@ class Summarizer:
         for metric_name, run_spec_names in metric_name_to_run_spec_names.items():
             if metric_name not in defined_metric_names:
                 hlog(
-                    f"WARNING: metric name {metric_name} undefined in {SCHEMA_YAML_FILENAME} "
+                    f"WARNING: metric name {metric_name} undefined in {self.schema_file} "
                     f"but appears in {len(run_spec_names)} run specs, including {run_spec_names[0]}"
                 )
 
@@ -564,12 +589,12 @@ class Summarizer:
         # TODO: move to write_executive_summary()
         models_to_costs: Dict[str, Dict[str]] = defaultdict(lambda: defaultdict(int))
         for run in self.runs:
-            model: str = run.run_spec.adapter_spec.model
+            deployment: str = run.run_spec.adapter_spec.model_deployment
 
             for stat in run.stats:
                 stat_name = stat.name.name
                 if stat_name in Summarizer.COST_REPORT_FIELDS and not stat.name.split:
-                    models_to_costs[model][stat_name] += stat.sum
+                    models_to_costs[deployment][stat_name] += stat.sum
 
         # Do a second pass to add up the total number of tokens
         for costs in models_to_costs.values():
@@ -639,7 +664,8 @@ class Summarizer:
             header = [
                 HeaderCell("Group"),
                 HeaderCell("Description"),
-                # Synchronize these names with `schema.yaml`
+                # Synchronize these names with the appropriate schema file
+                # TODO: different schema files might have different fields (for multimodal)
                 HeaderCell("Adaptation method", description="Adaptation strategy (e.g., generation)"),
                 HeaderCell("# instances", description="Number of instances evaluated on"),
                 HeaderCell("# references", description="Number of references provided per instance"),
@@ -660,7 +686,7 @@ class Summarizer:
                 for subgroup in self.expand_subgroups(group):
                     for adapter_spec, runs in self.group_adapter_to_runs[subgroup.name].items():
                         filtered_runs = self.filter_runs_by_visibility(runs, subgroup)
-                        models.add(adapter_spec.model)
+                        models.add(adapter_spec.model_deployment)
                         methods.add(adapter_spec.method)
                         for run in filtered_runs:
                             num_instances.extend(get_all_stats_by_name(run.stats, "num_instances"))
@@ -810,7 +836,7 @@ class Summarizer:
                     matcher = replace(matcher, sub_split=sub_split)
                 header_field = self.schema.name_to_metric.get(matcher.name)
                 if header_field is None:
-                    hlog(f"WARNING: metric name {matcher.name} undefined in {SCHEMA_YAML_FILENAME}, skipping")
+                    hlog(f"WARNING: metric name {matcher.name} undefined in {self.schema_file}, skipping")
                     continue
                 metadata = {
                     "metric": header_field.get_short_display_name(),
@@ -869,33 +895,35 @@ class Summarizer:
             model_order = [model.name for model in self.schema.models]
 
             def _adapter_spec_sort_key(spec):
-                index = model_order.index(spec.model) if spec.model in model_order else -1
-                return (index, spec.model)
+                index = model_order.index(spec.model_deployment) if spec.model_deployment in model_order else -1
+                return (index, spec.model_deployment)
 
             adapter_specs = list(sorted(adapter_specs, key=_adapter_spec_sort_key))
 
         # Pull out only the keys of the method adapter_spec that is needed to
         # uniquely identify the method.
-        infos = unique_simplification(list(map(asdict_without_nones, adapter_specs)), ["model"])
+        infos = unique_simplification(list(map(asdict_without_nones, adapter_specs)), ["model_deployment", "model"])
 
         assert len(adapter_specs) == len(infos), [adapter_specs, infos]
 
         # Populate the contents of the table
         rows = []
         for adapter_spec, info in zip(adapter_specs, infos):
-            model_name: str = adapter_spec.model
-
-            # Get the model display name from the schema.
-            # Fall back to using the model name as the model display name if the model is not
-            # defined in the schema.
-            model_display_name = (
-                self.schema.name_to_model[model_name].display_name
-                if model_name in self.schema.name_to_model
-                else model_name
+            deployment: str = (
+                adapter_spec.model_deployment if len(adapter_spec.model_deployment) > 0 else adapter_spec.model
             )
+            try:
+                model_metadata: ModelMetadata = get_metadata_for_deployment(deployment)
+            except ValueError as e:
+                if self.allow_unknown_models:
+                    model_metadata = get_default_model_metadata(deployment)
+                else:
+                    raise e
+
+            model_name: str = model_metadata.name
 
             runs = adapter_to_runs[adapter_spec]
-            display_name = get_method_display_name(model_display_name, info)
+            display_name = get_method_display_name(model_metadata.display_name, info)
 
             # Link to all the runs under this model
             if link_to_runs:
@@ -1249,11 +1277,14 @@ class Summarizer:
         if os.path.islink(symlink_path):
             # Remove the previous symlink if it exists.
             os.unlink(symlink_path)
-        os.symlink(os.path.abspath(self.run_release_path), symlink_path)
+        os.symlink(os.path.basename(self.run_release_path), symlink_path)
 
     def run_pipeline(self, skip_completed: bool, num_instances: int) -> None:
-        """Run the entire summarization pipeline pipeline."""
+        """Run the entire summarization pipeline."""
+        self.write_schema()
+
         self.read_runs()
+        self.group_runs()
         self.check_metrics_defined()
 
         self.write_run_display_json(skip_completed)
@@ -1276,11 +1307,17 @@ class Summarizer:
         self.symlink_latest()
 
 
-@htrack(None)
+@htrack("summarize")
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-o", "--output-path", type=str, help="Where the benchmarking output lives", default="benchmark_output"
+    )
+    parser.add_argument(
+        "--schema-file",
+        type=str,
+        help="File name of the schema to read (e.g., schema_classic.yaml).",
+        default=SCHEMA_CLASSIC_YAML_FILENAME,
     )
     parser.add_argument(
         "--suite",
@@ -1312,6 +1349,18 @@ def main():
         help="Number of instance ids we're using; only for annotating scenario spec instance ids file",
         default=1000,
     )
+    parser.add_argument(
+        "--local-path",
+        type=str,
+        help="If running locally, the path for `ServerService`.",
+        default="prod_env",
+    )
+    parser.add_argument(
+        "--allow-unknown-models",
+        type=bool,
+        help="Whether to allow unknown models in the metadata file",
+        default=True,
+    )
     args = parser.parse_args()
 
     release: Optional[str] = None
@@ -1335,14 +1384,18 @@ def main():
     else:
         raise ValueError("Exactly one of --release or --suite must be specified.")
 
+    register_helm_configurations(base_path=args.local_path)
+
     # Output JSON files summarizing the benchmark results which will be loaded in the web interface
     summarizer = Summarizer(
         release=release,
         suites=suites,
         suite=suite,
+        schema_file=args.schema_file,
         output_path=args.output_path,
         verbose=args.debug,
         num_threads=args.num_threads,
+        allow_unknown_models=args.allow_unknown_models,
     )
     summarizer.run_pipeline(skip_completed=args.skip_completed_run_display_json, num_instances=args.num_instances)
     hlog("Done.")

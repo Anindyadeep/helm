@@ -1,5 +1,5 @@
 # mypy: check_untyped_defs = False
-from helm.benchmark.scenarios.scenario import Instance, Input, Output, Reference, CORRECT_TAG
+from helm.benchmark.scenarios.scenario import TEST_SPLIT, TRAIN_SPLIT, Instance, Input, Output, Reference, CORRECT_TAG
 from helm.benchmark.adaptation.adapter_spec import AdapterSpec
 from .adapter_factory import AdapterFactory, ADAPT_MULTIPLE_CHOICE_JOINT
 from .test_adapter import TestAdapter
@@ -7,7 +7,9 @@ from .test_adapter import TestAdapter
 
 class TestMultipleChoiceJointAdapter(TestAdapter):
     def test_sample_examples(self):
-        adapter_spec = AdapterSpec(method=ADAPT_MULTIPLE_CHOICE_JOINT, model="openai/ada", max_train_instances=4)
+        adapter_spec = AdapterSpec(
+            method=ADAPT_MULTIPLE_CHOICE_JOINT, model="openai/ada", model_deployment="openai/ada", max_train_instances=4
+        )
         adapter = AdapterFactory.get_adapter(adapter_spec, self.tokenizer_service)
         all_train_instances = [
             Instance(Input(text="say no"), references=[Reference(Output(text="no"), tags=[CORRECT_TAG])]),
@@ -27,13 +29,20 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
         assert examples[3].input.text == "say yes3"
 
     def test_sample_examples_no_train_instances(self):
-        adapter_spec = AdapterSpec(method=ADAPT_MULTIPLE_CHOICE_JOINT, model="openai/ada", max_train_instances=2)
+        adapter_spec = AdapterSpec(
+            method=ADAPT_MULTIPLE_CHOICE_JOINT, model="openai/ada", model_deployment="openai/ada", max_train_instances=2
+        )
         adapter = AdapterFactory.get_adapter(adapter_spec, self.tokenizer_service)
         examples = adapter.sample_examples(all_train_instances=[], seed=0)
         assert len(examples) == 0
 
     def test_sample_examples_greater_max_train_instances(self):
-        adapter_spec = AdapterSpec(method=ADAPT_MULTIPLE_CHOICE_JOINT, model="openai/ada", max_train_instances=10)
+        adapter_spec = AdapterSpec(
+            method=ADAPT_MULTIPLE_CHOICE_JOINT,
+            model="openai/ada",
+            model_deployment="openai/ada",
+            max_train_instances=10,
+        )
         adapter = AdapterFactory.get_adapter(adapter_spec, self.tokenizer_service)
         all_train_instances = [
             Instance(Input(text="say no"), references=[Reference(Output(text="no"), tags=[CORRECT_TAG])]),
@@ -45,9 +54,15 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
         assert len(examples) == 3
 
     def test_multiple_correct_reference(self):
-        adapter_spec = AdapterSpec(method=ADAPT_MULTIPLE_CHOICE_JOINT, model="openai/ada", max_train_instances=10)
+        adapter_spec = AdapterSpec(
+            method=ADAPT_MULTIPLE_CHOICE_JOINT,
+            model="openai/ada",
+            model_deployment="openai/ada",
+            max_train_instances=10,
+            sample_train=False,
+        )
         adapter = AdapterFactory.get_adapter(adapter_spec, self.tokenizer_service)
-        adapter.train_instances = [
+        train_instances = [
             Instance(
                 Input(text="Second reference is correct"),
                 references=[
@@ -55,6 +70,7 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
                     Reference(Output(text="Second"), tags=[CORRECT_TAG]),
                     Reference(Output(text="Third"), tags=[]),
                 ],
+                split=TRAIN_SPLIT,
             ),
             Instance(
                 Input(text="First and second references are correct"),
@@ -63,9 +79,9 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
                     Reference(Output(text="Second"), tags=[CORRECT_TAG]),
                     Reference(Output(text="Third"), tags=[]),
                 ],
+                split=TRAIN_SPLIT,
             ),
         ]
-        adapter.train_trial_index = 0
         eval_instance = Instance(
             Input(text="First reference is correct"),
             references=[
@@ -73,8 +89,9 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
                 Reference(Output(text="Second"), tags=[]),
                 Reference(Output(text="Third"), tags=[]),
             ],
+            split=TEST_SPLIT,
         )
-        actual_instances = adapter.generate_requests(eval_instance)
+        actual_instances = adapter.adapt(train_instances + [eval_instance], parallelism=1).request_states
         assert len(actual_instances) == 1
         assert actual_instances[0].request.prompt == (
             "Input: Second reference is correct\n"
@@ -96,10 +113,15 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
 
     def test_multiple_correct_reference_multi_label(self):
         adapter_spec = AdapterSpec(
-            method=ADAPT_MULTIPLE_CHOICE_JOINT, model="openai/ada", max_train_instances=10, multi_label=True
+            method=ADAPT_MULTIPLE_CHOICE_JOINT,
+            model="openai/ada",
+            model_deployment="openai/ada",
+            max_train_instances=10,
+            multi_label=True,
+            sample_train=False,
         )
         adapter = AdapterFactory.get_adapter(adapter_spec, self.tokenizer_service)
-        adapter.train_instances = [
+        train_instances = [
             Instance(
                 Input(text="Second reference is correct"),
                 references=[
@@ -107,6 +129,7 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
                     Reference(Output(text="Second"), tags=[CORRECT_TAG]),
                     Reference(Output(text="Third"), tags=[]),
                 ],
+                split=TRAIN_SPLIT,
             ),
             Instance(
                 Input(text="First and second references are correct"),
@@ -115,9 +138,9 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
                     Reference(Output(text="Second"), tags=[CORRECT_TAG]),
                     Reference(Output(text="Third"), tags=[]),
                 ],
+                split=TRAIN_SPLIT,
             ),
         ]
-        adapter.train_trial_index = 0
         eval_instance = Instance(
             Input(text="First reference is correct"),
             references=[
@@ -125,8 +148,9 @@ class TestMultipleChoiceJointAdapter(TestAdapter):
                 Reference(Output(text="Second"), tags=[]),
                 Reference(Output(text="Third"), tags=[]),
             ],
+            split=TEST_SPLIT,
         )
-        actual_instances = adapter.generate_requests(eval_instance)
+        actual_instances = adapter.adapt(train_instances + [eval_instance], parallelism=1).request_states
         assert len(actual_instances) == 1
         assert actual_instances[0].request.prompt == (
             "Input: Second reference is correct\n"

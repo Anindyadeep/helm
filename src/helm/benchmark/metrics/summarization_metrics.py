@@ -5,6 +5,7 @@ import os
 import pickle
 
 import spacy
+import spacy.cli
 from typing import List, Dict, Optional
 from collections import defaultdict
 
@@ -23,12 +24,11 @@ from .summac.model_summac import SummaCZS
 from bert_score import BERTScorer
 
 
-QAFACTEVAL_CODALAB_LINK: str = (
-    "https://worksheets.codalab.org/rest/bundles/0xf4de83c1f0d34d7999480223e8f5ab87/contents/blob/"
+QAFACTEVAL_URL: str = (
+    "https://storage.googleapis.com/crfm-helm-public/source_datasets/metrics/summarization_metrics/qafacteval.pk"
 )
-HUMAN_EVAL_CODALAB_LINK: str = (
-    "https://worksheets.codalab.org/rest/bundles/0x3fb04ae3ae024c369d048f6c2cdf16cb/"
-    "contents/blob/codalab_merged_results/{file_name}"
+HUMAN_EVAL_URL: str = (
+    "https://storage.cloud.google.com/crfm-helm-public/source_datasets/metrics/summarization_metrics/{file_name}"
 )
 
 
@@ -53,12 +53,12 @@ class SummarizationMetric(Metric):
         # avoid triggering a bug in DataStatsMetric that raises
         # `NameError: name 'stderr' is not defined`
         if not spacy.util.is_package("en_core_web_sm"):
-            spacy.cli.download("en_core_web_sm")  # type: ignore
+            spacy.cli.download("en_core_web_sm")
 
         try:
             from summ_eval.data_stats_metric import DataStatsMetric
         except ModuleNotFoundError as e:
-            handle_module_not_found_error(e)
+            handle_module_not_found_error(e, ["metrics"])
 
         self.data_stats_metric = DataStatsMetric()
         self.task: str = task
@@ -79,7 +79,7 @@ class SummarizationMetric(Metric):
 
     def _load_qafacteval(self, eval_cache_path: str):
         target_path: str = os.path.join(eval_cache_path, "qafacteval.pk")
-        ensure_file_downloaded(source_url=QAFACTEVAL_CODALAB_LINK, target_path=target_path)
+        ensure_file_downloaded(source_url=QAFACTEVAL_URL, target_path=target_path)
 
         with open(target_path, "rb") as fin:
             qafacteval_scores = pickle.load(fin)
@@ -169,7 +169,6 @@ class SummarizationMetric(Metric):
         metric_service: MetricService,
         eval_cache_path: str,
     ) -> List[Stat]:
-
         refs: List[str] = [self._remove_braces(ref.output.text) for ref in request_state.instance.references]
         inp: str = self._remove_braces(request_state.instance.input.text)
 
@@ -183,9 +182,9 @@ class SummarizationMetric(Metric):
                 self.humaneval = self._load_humaneval(eval_cache_path)
 
             # get human evaluation scores if they exist
-            model_name = adapter_spec.model.replace("/", "_")
+            deployment = adapter_spec.model_deployment.replace("/", "_")
             for metric_name in ["faithfulness", "relevance", "coherence"]:
-                val = self.humaneval[(metric_name, model_name, request_state.instance.id, pred)]
+                val = self.humaneval[(metric_name, deployment, request_state.instance.id, pred)]
                 result.append(Stat(MetricName(f"HumanEval-{metric_name}")).add(float(val)))
         except KeyError:
             pass
@@ -197,8 +196,8 @@ class SummarizationMetric(Metric):
             if self.qa_fact_eval is None:
                 self._load_qafacteval(eval_cache_path)
             assert self.qa_fact_eval is not None
-            model_name = adapter_spec.model.replace("/", "_")
-            val = self.qa_fact_eval[model_name][(request_state.instance.id, pred)]
+            deployment = adapter_spec.model_deployment.replace("/", "_")
+            val = self.qa_fact_eval[deployment][(request_state.instance.id, pred)]
             result.append(Stat(MetricName("QAFactEval")).add(float(val)))
         except KeyError:
             pass
@@ -271,7 +270,7 @@ class SummarizationHumanEvalAnalyzer:
 
         tasks_by_id = defaultdict(list)
 
-        download_filename = HUMAN_EVAL_CODALAB_LINK.format(file_name=filename)
+        download_filename = HUMAN_EVAL_URL.format(file_name=filename)
         filename = os.path.join(self.eval_download_path, filename)
         ensure_file_downloaded(source_url=download_filename, target_path=filename)
         mturk_data = pandas.read_csv(filename)

@@ -7,7 +7,13 @@ from helm.benchmark.model_deployment_registry import (
     WindowServiceSpec,
     register_model_deployment,
 )
+from helm.benchmark.model_metadata_registry import (
+    get_model_metadata,
+    get_default_model_metadata,
+    register_model_metadata,
+)
 from helm.benchmark.tokenizer_config_registry import TokenizerConfig, TokenizerSpec, register_tokenizer_config
+from helm.common.hierarchical_logger import hlog
 
 
 def register_huggingface_model(
@@ -30,11 +36,22 @@ def register_huggingface_model(
             args=object_spec_args,
         ),
     )
+
+    # We check if the model is already registered because we don't want to
+    # overwrite the model metadata if it's already registered.
+    # If it's not registered, we register it, as otherwise an error would be thrown
+    # when we try to register the model deployment.
+    try:
+        _ = get_model_metadata(model_name=helm_model_name)
+    except ValueError:
+        register_model_metadata(get_default_model_metadata(helm_model_name))
+        hlog(f"Registered default metadata for model {helm_model_name}")
+
     register_model_deployment(model_deployment)
     tokenizer_config = TokenizerConfig(
         name=helm_model_name,
         tokenizer_spec=TokenizerSpec(
-            class_name="helm.proxy.clients.huggingface_client.HuggingFaceClient",
+            class_name="helm.proxy.tokenizers.huggingface_tokenizer.HuggingFaceTokenizer",
             args=object_spec_args,
         ),
     )

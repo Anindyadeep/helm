@@ -7,17 +7,17 @@ from helm.benchmark.huggingface_registration import (
 )
 
 from helm.benchmark.presentation.run_entry import RunEntry, read_run_entries
+from helm.common.general import ensure_directory_exists
 from helm.common.hierarchical_logger import hlog, htrack, htrack_block
 from helm.common.authentication import Authentication
 from helm.common.object_spec import parse_object_spec, get_class_by_name
-from helm.proxy.clients.remote_model_registry import check_and_register_remote_model
 from helm.proxy.services.remote_service import create_authentication, add_service_args
 
-from helm.benchmark.model_metadata_registry import register_model_metadata_from_path
-from helm.benchmark.model_deployment_registry import register_model_deployments_from_path
+from helm.benchmark.config_registry import register_helm_configurations
 from helm.benchmark.adaptation.adapter_spec import AdapterSpec
+from helm.benchmark import vlm_run_specs  # noqa
 from .executor import ExecutionSpec
-from .runner import Runner, RunSpec, LATEST_SYMLINK
+from .runner import Runner, RunSpec, LATEST_SYMLINK, set_benchmark_output_path
 from .run_specs import construct_run_specs
 
 
@@ -239,29 +239,10 @@ def main():
         help="Experimental: Enable using AutoModelForCausalLM models from a local path.",
     )
     parser.add_argument(
-        "--enable-remote-models",
-        nargs="+",
-        default=[],
-        help="Experimental: Enable remote service models that are not available on the client. "
-        "The client will use RemoteWindowService for windowing.",
-    )
-    parser.add_argument(
         "--runner-class-name",
         type=str,
         default=None,
         help="Full class name of the Runner class to use. If unset, uses the default Runner.",
-    )
-    parser.add_argument(
-        "--model-metadata-paths",
-        nargs="+",
-        help="Experimental: Where to read model metadata from",
-        default=[],
-    )
-    parser.add_argument(
-        "--model-deployment-paths",
-        nargs="+",
-        help="Experimental: Where to read model deployments from",
-        default=[],
     )
     add_run_args(parser)
     args = parser.parse_args()
@@ -271,13 +252,6 @@ def main():
         register_huggingface_hub_model_from_flag_value(huggingface_model_name)
     for huggingface_model_path in args.enable_local_huggingface_models:
         register_huggingface_local_model_from_flag_value(huggingface_model_path)
-    for model_metadata_path in args.model_metadata_paths:
-        register_model_metadata_from_path(model_metadata_path)
-    for model_deployment_paths in args.model_deployment_paths:
-        register_model_deployments_from_path(model_deployment_paths)
-
-    if args.server_url and args.enable_remote_models:
-        check_and_register_remote_model(args.server_url, args.enable_remote_models)
 
     run_entries: List[RunEntry] = []
     if args.conf_paths:
@@ -286,6 +260,13 @@ def main():
         run_entries.extend(
             [RunEntry(description=description, priority=1, groups=None) for description in args.run_specs]
         )
+
+    # Must set benchmark output path before getting RunSpecs,
+    # because run spec functions can use the benchmark output directory for caching.
+    ensure_directory_exists(args.output_path)
+    set_benchmark_output_path(args.output_path)
+
+    register_helm_configurations(base_path=args.local_path)
 
     run_specs = run_entries_to_run_specs(
         run_entries=run_entries,

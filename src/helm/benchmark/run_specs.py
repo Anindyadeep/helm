@@ -1,8 +1,16 @@
-import importlib
+import dataclasses
 import itertools
 from functools import partial
 from typing import Any, Callable, List, Dict, Optional, Set, TypeVar
 
+from helm.benchmark.model_deployment_registry import ALL_MODEL_DEPLOYMENTS, DEPLOYMENT_NAME_TO_MODEL_DEPLOYMENT
+from helm.benchmark.scenarios.commonsense_scenario import (
+    CommonSenseQAScenario,
+    HellaSwagScenario,
+    OpenBookQA,
+    PiqaScenario,
+    SiqaScenario,
+)
 from helm.common.hierarchical_logger import hlog, htrack
 from helm.common.object_spec import ObjectSpec
 from helm.benchmark.adaptation.adapters.adapter_factory import (
@@ -15,30 +23,27 @@ from helm.benchmark.adaptation.adapters.adapter_factory import (
 )
 from helm.benchmark.adaptation.adapters.binary_ranking_adapter import BinaryRankingAdapter
 from helm.benchmark.adaptation.adapter_spec import AdapterSpec
-from helm.common.optional_dependencies import handle_module_not_found_error
 from .metrics.metric import MetricSpec
 from .run_expander import (
     RUN_EXPANDERS,
     GlobalPrefixRunExpander,
+    AnthropicRunExpander,
+    OpenAIRunExpander,
+    GoogleRunExpander,
     StopRunExpander,
     ChatMLRunExpander,
-    AddToStopRunExpander,
-    IncreaseMaxTokensRunExpander,
-    FormatPromptRunExpander,
     IncreaseTemperatureRunExpander,
 )
-from .runner import RunSpec
+from .runner import RunSpec, get_benchmark_output_path
 from .scenarios.lex_glue_scenario import (
     get_lex_glue_max_train_instances,
     get_lex_glue_instructions,
     get_lex_glue_max_tokens,
     get_lex_glue_task_type,
 )
-from .scenarios.scenario import ScenarioSpec
-from .scenarios.big_bench_scenario import BIGBenchScenario
+from .scenarios.scenario import ScenarioSpec, get_scenario_cache_path
 from .scenarios.msmarco_scenario import MSMARCOScenario
 from .scenarios.copyright_scenario import datatag2hash_code
-from .scenarios.raft_scenario import get_raft_instructions
 from .scenarios.lextreme_scenario import (
     get_lextreme_instructions,
     get_lextreme_max_train_instances,
@@ -46,16 +51,25 @@ from .scenarios.lextreme_scenario import (
     TaskType,
     get_lextreme_task_type,
 )
-from helm.proxy.models import (
-    get_model,
+from helm.benchmark.model_deployment_registry import (
+    ModelDeployment,
+    get_model_deployment,
+)
+from helm.benchmark.model_metadata_registry import (
+    ModelMetadata,
+    get_model_metadata,
+    ANTHROPIC_CLAUDE_1_MODEL_TAG,
+    ANTHROPIC_CLAUDE_2_MODEL_TAG,
+    GOOGLE_PALM_2_MODEL_TAG,
     NO_NEWLINES_TAG,
     NLG_PREFIX_TAG,
     CHATML_MODEL_TAG,
     OPENAI_CHATGPT_MODEL_TAG,
-    ANTHROPIC_MODEL_TAG,
     BUGGY_TEMP_0_TAG,
 )
 from helm.common.general import singleton
+
+INCLUDE_GENERATIVE_HARMS_METRICS = False
 
 
 ############################################################
@@ -390,10 +404,10 @@ def get_machine_translation_adapter_spec(
     """
     return AdapterSpec(
         method=ADAPT_GENERATION,
-        instructions=f"Translate {source_language} to {target_language}:",
-        input_prefix="",
-        input_suffix=" = ",
-        output_prefix="",
+        instructions=f"Translate the following sentences from {source_language} to {target_language}.",
+        input_prefix=f"{source_language}: ",
+        input_suffix="\n",
+        output_prefix=f"{target_language}: ",
         output_suffix="\n",
         max_train_instances=max_train_instances,
         num_outputs=1,
@@ -430,6 +444,7 @@ def get_adapter_spec1() -> AdapterSpec:
         num_outputs=3,
         num_train_trials=3,
         model="simple/model1",
+        model_deployment="simple/model1",
         temperature=1,
         stop_sequences=["."],
     )
@@ -523,6 +538,9 @@ def get_bias_metric_specs() -> List[MetricSpec]:
 
 
 def get_generative_harms_metric_specs(include_basic_metrics: bool = False) -> List[MetricSpec]:
+    # In classic HELM, we included bias/toxicity measures, but now we don't to streamline.
+    if not INCLUDE_GENERATIVE_HARMS_METRICS:
+        return []
     return (
         get_bias_metric_specs()
         + get_toxicity_metric_specs()
@@ -612,12 +630,6 @@ def get_code_metric_specs(dataset: str, timeout: float) -> List[MetricSpec]:
 
 def get_open_ended_generation_metric_specs() -> List[MetricSpec]:
     return get_basic_metric_specs(["exact_match", "quasi_exact_match", "f1_score", "rouge_l", "bleu_1", "bleu_4"])
-
-
-def get_machine_translation_metric_specs() -> List[MetricSpec]:
-    return [
-        MetricSpec(class_name="helm.benchmark.metrics.machine_translation_metrics.MachineTranslationMetric", args={})
-    ] + get_basic_metric_specs([])
 
 
 def get_cleva_machine_translation_metric_specs() -> List[MetricSpec]:
@@ -872,6 +884,37 @@ def get_civil_comments_spec(demographic: str) -> RunSpec:
     )
 
 
+@run_spec_function("custom_mcqa")
+def get_custom_mcqa_spec(
+    path: str,
+    num_train_instances: int = 0,
+    method: str = ADAPT_MULTIPLE_CHOICE_JOINT,
+) -> RunSpec:
+    scenario_spec = ScenarioSpec(
+        class_name="helm.benchmark.scenarios.custom_mcqa_scenario.CustomMCQAScenario",
+        args={
+            "path": path,
+            "num_train_instances": num_train_instances,
+        },
+    )
+
+    adapter_spec = get_multiple_choice_adapter_spec(
+        method=method,
+        instructions="The following are multiple choice questions (with answers).",
+        input_noun="Question",
+        output_noun="Answer",
+        max_train_instances=num_train_instances,
+    )
+
+    return RunSpec(
+        name=f"custom_mcqa,path={path},method={method}",
+        scenario_spec=scenario_spec,
+        adapter_spec=adapter_spec,
+        metric_specs=get_exact_match_metric_specs(),
+        groups=["custom"],
+    )
+
+
 @run_spec_function("mmlu")
 def get_mmlu_spec(subject: str, method: str = ADAPT_MULTIPLE_CHOICE_JOINT) -> RunSpec:
     scenario_spec = ScenarioSpec(
@@ -944,10 +987,23 @@ def get_wikifact_spec(k: str, subject: str) -> RunSpec:
 
 @run_spec_function("commonsense")
 def get_commonsense_spec(dataset: str, method: str) -> RunSpec:
-    scenario_spec = ScenarioSpec(
-        class_name="helm.benchmark.scenarios.commonsense_scenario.CommonSenseScenario",
-        args={"dataset": dataset},
-    )
+    # TODO Split these into their own run_spec_function.
+    if dataset == HellaSwagScenario.name:
+        scenario_spec = ScenarioSpec(
+            class_name="helm.benchmark.scenarios.commonsense_scenario.HellaSwagScenario", args={}
+        )
+    elif dataset == OpenBookQA.name:
+        scenario_spec = ScenarioSpec(class_name="helm.benchmark.scenarios.commonsense_scenario.OpenBookQA", args={})
+    elif dataset == CommonSenseQAScenario.name:
+        scenario_spec = ScenarioSpec(
+            class_name="helm.benchmark.scenarios.commonsense_scenario.CommonSenseQAScenario", args={}
+        )
+    elif dataset == SiqaScenario.name:
+        scenario_spec = ScenarioSpec(class_name="helm.benchmark.scenarios.commonsense_scenario.SiqaScenario", args={})
+    elif dataset == PiqaScenario.name:
+        scenario_spec = ScenarioSpec(class_name="helm.benchmark.scenarios.commonsense_scenario.PiqaScenario", args={})
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
 
     adapter_spec = get_multiple_choice_adapter_spec(
         method=method,
@@ -1102,19 +1158,23 @@ def get_gsm_spec() -> RunSpec:
         name="gsm",
         scenario_spec=scenario_spec,
         adapter_spec=adapter_spec,
-        metric_specs=get_basic_metric_specs(["exact_match_indicator"]) + get_generative_harms_metric_specs(),
+        metric_specs=get_basic_metric_specs(["exact_match_indicator", "final_number_exact_match"])
+        + get_generative_harms_metric_specs(),
         groups=["gsm"],
     )
 
 
 @run_spec_function("raft")
 def get_raft_spec(subset: str) -> RunSpec:
+    from helm.benchmark.scenarios.raft_scenario import RAFTScenario, get_raft_instructions
+
     scenario_spec = ScenarioSpec(
         class_name="helm.benchmark.scenarios.raft_scenario.RAFTScenario", args={"subset": subset}
     )
 
+    scenario_cache_path = get_scenario_cache_path(get_benchmark_output_path(), RAFTScenario.name)
     adapter_spec = get_generation_adapter_spec(
-        instructions=get_raft_instructions(subset),
+        instructions=get_raft_instructions(subset, scenario_cache_path),
         input_noun=None,
         output_noun="Label",
         max_tokens=30,  # at most ~50 characters per label
@@ -1135,7 +1195,8 @@ def get_numeracy_spec(
 ) -> RunSpec:
     from .scenarios.numeracy_scenario import get_numeracy_adapter_spec, RELTYPE_INFO
 
-    run_solver: bool = True if run_solver == "True" else False  # type: ignore
+    run_solver_bool: bool = True if run_solver == "True" else False
+    del run_solver
     random_seed = int(seed)
     scenario_spec = ScenarioSpec(
         class_name="helm.benchmark.scenarios.numeracy_scenario.NumeracyScenario",
@@ -1175,7 +1236,7 @@ def get_numeracy_spec(
         name=f"numeracy:relation_type={relation_type},mode={mode}",
         scenario_spec=scenario_spec,
         adapter_spec=adapter_spec,
-        metric_specs=get_numeracy_metric_specs(run_solver),  # type: ignore
+        metric_specs=get_numeracy_metric_specs(run_solver_bool),
         groups=["numeracy"],
     )
 
@@ -1187,21 +1248,25 @@ def get_math_spec(
     use_official_examples: str = "False",
     use_chain_of_thought: str = "False",
 ) -> RunSpec:
-    use_official_examples: bool = use_official_examples == "True"  # type: ignore
-    use_chain_of_thought: bool = use_chain_of_thought == "True"  # type: ignore
-    if use_chain_of_thought:
-        assert not use_official_examples, "Cannot use official examples when use_chain_of_thought is True."
+    # Convert to bools and remove the str versions
+    use_official_examples_bool: bool = use_official_examples == "True"
+    use_chain_of_thought_bool: bool = use_chain_of_thought == "True"
+    del use_official_examples
+    del use_chain_of_thought
+
+    if use_chain_of_thought_bool:
+        assert not use_official_examples_bool, "Cannot use official examples when use_chain_of_thought is True."
     scenario_spec = ScenarioSpec(
         class_name="helm.benchmark.scenarios.math_scenario.MATHScenario",
         args={
             "subject": subject,
             "level": level,
-            "use_official_examples": use_official_examples,
-            "use_chain_of_thought": use_chain_of_thought,
+            "use_official_examples": use_official_examples_bool,
+            "use_chain_of_thought": use_chain_of_thought_bool,
         },
     )
 
-    if use_chain_of_thought:  # Include the solution in the output as per https://arxiv.org/abs/2201.11903
+    if use_chain_of_thought_bool:  # Include the solution in the output as per https://arxiv.org/abs/2201.11903
         output_prefix = "Answer: "  # Don't include LaTeX '$' delimiters
         output_suffix = "\n"
         instance_prefix = "###\n"  # Don't include LaTeX '$' delimiters
@@ -1233,10 +1298,10 @@ def get_math_spec(
 
     return RunSpec(
         name=f"math:subject={subject},level={level},"
-        f"use_official_examples={use_official_examples},use_chain_of_thought={use_chain_of_thought}",
+        f"use_official_examples={use_official_examples_bool},use_chain_of_thought={use_chain_of_thought_bool}",
         scenario_spec=scenario_spec,
         adapter_spec=adapter_spec,
-        metric_specs=get_math_metric_specs(use_chain_of_thought) + get_generative_harms_metric_specs(),  # type: ignore
+        metric_specs=get_math_metric_specs(use_chain_of_thought_bool) + get_generative_harms_metric_specs(),
         groups=groups,
     )
 
@@ -1729,6 +1794,35 @@ def get_dyck_language_spec(num_parenthesis_pairs: int) -> RunSpec:
     )
 
 
+@run_spec_function("legalbench")
+def get_legalbench_spec(subset: str) -> RunSpec:
+    from helm.benchmark.scenarios.legalbench_scenario import (
+        LegalBenchScenario,
+        get_legalbench_instructions,
+        get_legalbench_output_nouns,
+    )
+
+    scenario_spec = ScenarioSpec(
+        class_name="helm.benchmark.scenarios.legalbench_scenario.LegalBenchScenario", args={"subset": subset}
+    )
+    scenario_cache_path = get_scenario_cache_path(get_benchmark_output_path(), LegalBenchScenario.name)
+    adapter_spec = get_generation_adapter_spec(
+        instructions=get_legalbench_instructions(subset, scenario_cache_path),
+        input_noun=None,
+        output_noun=get_legalbench_output_nouns(subset, scenario_cache_path),
+        max_tokens=30,  # at most ~50 characters per label,
+        max_train_instances=5,  # Use 5 for all subsets
+    )
+
+    return RunSpec(
+        name=f"legalbench:subset={subset}",
+        scenario_spec=scenario_spec,
+        adapter_spec=adapter_spec,
+        metric_specs=get_exact_match_metric_specs(),
+        groups=["legalbench"],
+    )
+
+
 @run_spec_function("legal_support")
 def get_legal_support_spec(method: str = ADAPT_MULTIPLE_CHOICE_JOINT) -> RunSpec:
     scenario_spec = ScenarioSpec(
@@ -1794,6 +1888,8 @@ def get_entity_data_imputation_spec(dataset: str) -> RunSpec:
 @htrack("Extracting adaptation parameters from the BIG-bench task definition and building the RunSpec")
 @run_spec_function("big_bench")
 def get_big_bench_spec(task: str, subtask: str) -> RunSpec:
+    from helm.benchmark.scenarios.big_bench_scenario import BIGBenchScenario
+
     def get_adaptation_method(big_bench_metrics: List[str]) -> str:
         """
         From BIG-bench, "there are three types of BIG-bench JSON tasks - generative and scoring
@@ -1838,16 +1934,14 @@ def get_big_bench_spec(task: str, subtask: str) -> RunSpec:
     )
 
     # Get BIG-bench task definition.
-    # TODO: get `output_path` here without hardcoding
-    output_path: str = "benchmark_output/scenarios/big_bench"
-    big_bench_task: Dict = BIGBenchScenario.download_and_get_task(output_path, task, subtask)
+    scenario_cache_path = get_scenario_cache_path(get_benchmark_output_path(), BIGBenchScenario.name)
+    big_bench_task: Dict = BIGBenchScenario.download_and_get_task(scenario_cache_path, task, subtask)
 
     # The JSON schema for BIG-bench can be found here:
     # https://github.com/google/BIG-bench/blob/main/docs/doc.md#json-schema.
     # "metrics" is a required field. The default values were populated using the link above.
     adapter_spec = AdapterSpec(
         method=get_adaptation_method(big_bench_task["metrics"]),
-        model="openai/text-curie-001",  # Can override with the `ModelRunExpander`.
         max_train_instances=5,  # Can override with the `MaxTrainInstancesRunExpander`.
         num_outputs=1,  # Can override with the `NumOutputsRunExpander`.
         # From "Beyond the Imitation Game: Quantifying and extrapolating the capabilities of language models",
@@ -1874,9 +1968,8 @@ def get_big_bench_spec(task: str, subtask: str) -> RunSpec:
         name=run_spec_name,
         scenario_spec=scenario_spec,
         adapter_spec=adapter_spec,
-        # TODO add generative harms when applicable
         metric_specs=get_metric_specs(big_bench_task["metrics"]),
-        groups=["BIG-bench"],
+        groups=[f"big_bench_{task}"],
     )
 
 
@@ -1990,7 +2083,7 @@ def get_med_qa_spec() -> RunSpec:
 
     adapter_spec = get_multiple_choice_adapter_spec(
         method=ADAPT_MULTIPLE_CHOICE_JOINT,
-        instructions="Give a letter answer among A, B, C or D.",
+        instructions="The following are multiple choice questions (with answers) about medicine.",
         input_noun="Question",
         output_noun="Answer",
     )
@@ -2000,7 +2093,7 @@ def get_med_qa_spec() -> RunSpec:
         scenario_spec=scenario_spec,
         adapter_spec=adapter_spec,
         metric_specs=get_exact_match_metric_specs(),
-        groups=["MedQA"],
+        groups=["med_qa"],
     )
 
 
@@ -2201,7 +2294,7 @@ def get_wmt_14_spec(language_pair: str, max_train_instances: int = 1) -> RunSpec
         name=f"wmt_14:language_pair={language_pair}",
         scenario_spec=scenario_spec,
         adapter_spec=adapter_spec,
-        metric_specs=get_machine_translation_metric_specs(),
+        metric_specs=get_open_ended_generation_metric_specs(),
         groups=["wmt_14"],
     )
 
@@ -2378,12 +2471,15 @@ def get_anthropic_hh_rlhf_spec(num_respondents: int, subset: str) -> RunSpec:
 
 @run_spec_function("cleva")
 def get_cleva_spec(task: str, version: str, subtask: Optional[str] = None, prompt_id: int = 0) -> RunSpec:
-    from .scenarios.cleva_scenario import CLEVAScenario  # noqa
+    from helm.benchmark.scenarios.cleva_scenario import CLEVAScenario  # noqa
 
-    CLEVAScenario.download_dataset(task, version)
+    scenario_cache_path = get_scenario_cache_path(get_benchmark_output_path(), CLEVAScenario.name)
+    CLEVAScenario.download_dataset(task, version, scenario_cache_path)
 
-    _, prompt_setting = CLEVAScenario.get_prompt_setting(task, subtask, version, prompt_id)
-    inference_parameters = CLEVAScenario.load_inference_parameters(task, subtask, version, prompt_id)
+    _, prompt_setting = CLEVAScenario.get_prompt_setting(task, subtask, version, prompt_id, scenario_cache_path)
+    inference_parameters = CLEVAScenario.load_inference_parameters(
+        task, subtask, version, prompt_id, scenario_cache_path
+    )
 
     class_name_prefix = "".join([word.capitalize() for word in task.split("_")])
     scenario_spec = ScenarioSpec(
@@ -2491,6 +2587,80 @@ def get_cleva_spec(task: str, version: str, subtask: Optional[str] = None, promp
 ############################################################
 
 
+def get_default_model_deployment_for_model(
+    model_name: str, warn_arg_deprecated: bool = False, ignore_deprecated: bool = False
+) -> Optional[str]:
+    """Returns a valid model deployment name corresponding to the given model arg.
+    This is used as a backwards compatibility layer for model names that are now moved to model deployments.
+    Example: "anthropic/claude-v1.3" => "anthropic/claude-v1.3"
+    Example: "meta/llama-7b" => "together/llama-7b"
+
+    The process to find a model deployment name is as follows:
+    1. If there is a model deployment with the same name as the model arg, use it.
+    2. If there is at least one deployment for the model, use the first one that is available.
+    3. If there are no deployments for the model, returns None.
+
+    This function will also try to find a model deployment name that is not deprecated.
+    If there are no non-deprecated deployments, it will return the first deployment (even if it's deprecated).
+    If ignore_deprecated is True, this function will return None if the model deployment is deprecated.
+
+    If warn_arg_deprecated is True, this function will print a warning if the model deployment name is not the same
+    as the model arg. This is to remind the user that the model name is deprecated and should be replaced with
+    the model deployment name (in their config).
+
+    Args:
+        model_arg: The model arg to convert to a model deployment name.
+        warn_arg_deprecated: Whether to print a warning if the model deployment name is not the same as the model arg.
+        ignore_deprecated: Whether to return None if the model deployment is deprecated.
+    """
+
+    # If there is a model deployment with the same name as the model arg, use it.
+    if model_name in DEPLOYMENT_NAME_TO_MODEL_DEPLOYMENT:
+        deployment: ModelDeployment = DEPLOYMENT_NAME_TO_MODEL_DEPLOYMENT[model_name]
+        if deployment.deprecated and ignore_deprecated:
+            if warn_arg_deprecated:
+                hlog(f"WARNING: Model deployment {model_name} is deprecated")
+            return None
+        return deployment.name
+
+    # If there is at least one deployment for the model, use the first one that is available.
+    available_deployments: List[ModelDeployment] = [
+        deployment for deployment in ALL_MODEL_DEPLOYMENTS if deployment.model_name == model_name
+    ]
+    if len(available_deployments) > 0:
+        available_deployment_names: List[str] = [deployment.name for deployment in available_deployments]
+        if warn_arg_deprecated:
+            hlog("WARNING: Model name is deprecated. Please use the model deployment name instead.")
+            hlog(f"Available model deployments for model {model_name}: {available_deployment_names}")
+
+        # Additionally, if there is a non-deprecated deployment, use it.
+        non_deprecated_deployments: List[ModelDeployment] = [
+            deployment for deployment in available_deployments if not deployment.deprecated
+        ]
+        if len(non_deprecated_deployments) > 0:
+            chosen_deployment = non_deprecated_deployments[0]
+        # There are no non-deprecated deployments, so there are two options:
+        # 1. If we can return an empty string, return it. (no model deployment is available)
+        # 2. If we can't return an empty string, return the first deployment (even if it's deprecated).
+        elif ignore_deprecated:
+            return None
+        else:
+            chosen_deployment = available_deployments[0]
+            if warn_arg_deprecated:
+                hlog(f"WARNING: All model deployments for model {model_name} are deprecated.")
+        if warn_arg_deprecated:
+            hlog(
+                f"Choosing {chosen_deployment.name} (the first one) as "
+                f"the default model deployment for model {model_name}"
+            )
+            hlog("If you want to use a different model deployment, please specify it explicitly.")
+        return chosen_deployment.name
+
+    # Some models are added but have no deployments yet.
+    # In this case, we return None.
+    return None
+
+
 def construct_run_specs(spec: ObjectSpec) -> List[RunSpec]:
     """
     Takes a specification (name, args) and returns a list of `RunSpec`s.
@@ -2516,13 +2686,41 @@ def construct_run_specs(spec: ObjectSpec) -> List[RunSpec]:
         ]
 
     def alter_run_spec(run_spec: RunSpec) -> RunSpec:
-        try:
-            model = get_model(run_spec.adapter_spec.model)
-        except ValueError:
-            # Models registered from configs cannot have expanders applied to them,
-            # because the models will not have been registered yet at this point.
-            # TODO: Figure out a cleaner way to deal with this.
-            return run_spec
+        if not run_spec.adapter_spec.model and not run_spec.adapter_spec.model_deployment:
+            raise ValueError("At least one of model_deployment and model must be specified")
+        elif not run_spec.adapter_spec.model and run_spec.adapter_spec.model_deployment:
+            # Infer model from model deployment
+            default_model_name = get_model_deployment(run_spec.adapter_spec.model_deployment).model_name
+            if not default_model_name:
+                default_model_name = run_spec.adapter_spec.model_deployment
+            run_spec = dataclasses.replace(
+                run_spec,
+                adapter_spec=dataclasses.replace(run_spec.adapter_spec, model=default_model_name),
+            )
+        elif run_spec.adapter_spec.model and not run_spec.adapter_spec.model_deployment:
+            # Infer model deployment from model
+            default_model_deployment = get_default_model_deployment_for_model(run_spec.adapter_spec.model)
+            if not default_model_deployment:
+                raise ValueError(
+                    f"Unknown model or no default model deployment found for model {run_spec.adapter_spec.model}"
+                )
+            run_spec = dataclasses.replace(
+                run_spec,
+                adapter_spec=dataclasses.replace(run_spec.adapter_spec, model_deployment=default_model_deployment),
+            )
+
+        # Both model and model_deployment should now be filled
+        assert run_spec.adapter_spec.model_deployment
+        assert run_spec.adapter_spec.model
+
+        model: ModelMetadata = get_model_metadata(run_spec.adapter_spec.model)
+        deployment: ModelDeployment = get_model_deployment(run_spec.adapter_spec.model_deployment)
+        if run_spec.adapter_spec.model != deployment.model_name:
+            raise ValueError(
+                f"Invalid RunSpec: selected model deployment '{run_spec.adapter_spec.model_deployment}'"
+                f"for model '{run_spec.adapter_spec.model}' but the model deployment is "
+                f"for a different model '{deployment.model_name}'"
+            )
         # For models that strip newlines, when we're generating, we need to set
         # the delimiter to be '###' so we stop properly.
         if NO_NEWLINES_TAG in model.tags and run_spec.adapter_spec.method in (
@@ -2536,42 +2734,21 @@ def construct_run_specs(spec: ObjectSpec) -> List[RunSpec]:
             global_prefix_expander = GlobalPrefixRunExpander(value="nlg")
             run_spec = singleton(global_prefix_expander.expand(run_spec))
 
-        # When running ChatGPT on non-language modelling tasks, increase max_tokens by 1
-        # to add room for the special message role token.
-        if OPENAI_CHATGPT_MODEL_TAG in model.tags and run_spec.adapter_spec.max_tokens:
-            increase_max_tokens_expander = IncreaseMaxTokensRunExpander(value=1)
-            run_spec = singleton(increase_max_tokens_expander.expand(run_spec))
-
         if CHATML_MODEL_TAG in model.tags:
             chatml_expander = ChatMLRunExpander()
             run_spec = singleton(chatml_expander.expand(run_spec))
 
-        if ANTHROPIC_MODEL_TAG in model.tags:
-            try:
-                import anthropic
-                from helm.proxy.clients.anthropic_client import AnthropicClient
-            except ModuleNotFoundError as e:
-                handle_module_not_found_error(e)
-            add_to_stop_expander = AddToStopRunExpander(anthropic.HUMAN_PROMPT)
-            increase_max_tokens_expander = IncreaseMaxTokensRunExpander(value=AnthropicClient.ADDITIONAL_TOKENS)
-            # Get scenario tags
-            components = run_spec.scenario_spec.class_name.split(".")
-            class_name = components[-1]
-            module_name = ".".join(components[:-1])
-            cls = getattr(importlib.import_module(module_name), class_name)
-            scenario_tags: List[str] = cls.tags
-            # If the scenario is instruction, do not use PROMPT_ANSWER_START
-            if "instructions" in scenario_tags:
-                format_expander = FormatPromptRunExpander(
-                    prefix=anthropic.HUMAN_PROMPT, suffix=f"{anthropic.AI_PROMPT}"
-                )
-            else:
-                format_expander = FormatPromptRunExpander(
-                    prefix=anthropic.HUMAN_PROMPT, suffix=f"{anthropic.AI_PROMPT} {AnthropicClient.PROMPT_ANSWER_START}"
-                )
-            run_spec = singleton(add_to_stop_expander.expand(run_spec))
-            run_spec = singleton(increase_max_tokens_expander.expand(run_spec))
-            run_spec = singleton(format_expander.expand(run_spec))
+        # Anthropic prompts
+        if ANTHROPIC_CLAUDE_1_MODEL_TAG in model.tags or ANTHROPIC_CLAUDE_2_MODEL_TAG in model.tags:
+            run_spec = singleton(AnthropicRunExpander().expand(run_spec))
+
+        # OpenAI prompts
+        if OPENAI_CHATGPT_MODEL_TAG in model.tags:
+            run_spec = singleton(OpenAIRunExpander().expand(run_spec))
+
+        # Google prompts
+        if GOOGLE_PALM_2_MODEL_TAG in model.tags:
+            run_spec = singleton(GoogleRunExpander().expand(run_spec))
 
         # For multiple choice
         if BUGGY_TEMP_0_TAG in model.tags and run_spec.adapter_spec.temperature == 0:

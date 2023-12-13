@@ -4,15 +4,9 @@ from typing import List, Dict, Any, Optional, Union
 import requests
 from retrying import retry
 
-from helm.common.cache import Cache, CacheConfig
-from helm.common.request import Request, RequestResult, Sequence, Token
-from helm.common.tokenization_request import (
-    TokenizationRequest,
-    TokenizationRequestResult,
-    DecodeRequest,
-    DecodeRequestResult,
-)
-from .client import Client, wrap_request_time, truncate_sequence, cleanup_str
+from helm.common.cache import CacheConfig
+from helm.common.request import wrap_request_time, Request, RequestResult, Sequence, Token
+from .client import CachingClient, truncate_sequence, cleanup_str
 
 
 MODEL_ALIASES: Dict[str, str] = {
@@ -21,6 +15,10 @@ MODEL_ALIASES: Dict[str, str] = {
     "h3-2.7b": "h3-2.7b-h3",
     "opt-1.3b": "opt-1.3b-ft-tp1",
     "opt-6.7b": "opt-6.7b-ft-tp1",
+    "mpt-7b": "togethercomputer/mpt-7b",
+    "mpt-instruct-7b": "togethercomputer/mpt-7b-instruct",
+    "stablelm-base-alpha-3b": "stabilityai/stablelm-base-alpha-3b",
+    "stablelm-base-alpha-7b": "stabilityai/stablelm-base-alpha-7b",
     # Production models
     "redpajama-incite-base-3b-v1": "togethercomputer/RedPajama-INCITE-Base-3B-v1",
     "redpajama-incite-instruct-3b-v1": "togethercomputer/RedPajama-INCITE-Instruct-3B-v1",
@@ -34,6 +32,8 @@ MODEL_ALIASES: Dict[str, str] = {
     "falcon-7b-instruct": "togethercomputer/falcon-7b-instruct",
     "falcon-40b": "togethercomputer/falcon-40b",
     "falcon-40b-instruct": "togethercomputer/falcon-40b-instruct",
+    "gpt-jt-6b-v1": "togethercomputer/GPT-JT-6B-v1",
+    "gpt-neoxt-chat-base-20b": "togethercomputer/GPT-NeoXT-Chat-Base-20B",
     "llama-7b": "huggyllama/llama-7b",
     "llama-13b": "huggyllama/llama-13b",
     "llama-30b": "huggyllama/llama-30b",
@@ -41,25 +41,25 @@ MODEL_ALIASES: Dict[str, str] = {
     "llama-2-7b": "togethercomputer/llama-2-7b",
     "llama-2-13b": "togethercomputer/llama-2-13b",
     "llama-2-70b": "togethercomputer/llama-2-70b",
-    "mpt-7b": "togethercomputer/mpt-7b",
-    "mpt-instruct-7b": "togethercomputer/mpt-7b-instruct",
+    "mistral-7b-v0.1": "mistralai/Mistral-7B-v0.1",
+    "mixtral-8x7b-32kseqlen": "mistralai/mixtral-8x7b-32kseqlen",
     "mpt-30b": "togethercomputer/mpt-30b",
     "mpt-instruct-30b": "togethercomputer/mpt-30b-instruct",
     "pythia-1b-v0": "EleutherAI/pythia-1b-v0",
     "pythia-2.8b-v0": "EleutherAI/pythia-2.8b-v0",
     "pythia-6.9b": "EleutherAI/pythia-6.9b",
     "pythia-12b-v0": "EleutherAI/pythia-12b-v0",
-    "stablelm-base-alpha-3b": "stabilityai/stablelm-base-alpha-3b",
-    "stablelm-base-alpha-7b": "stabilityai/stablelm-base-alpha-7b",
     "vicuna-7b-v1.3": "lmsys/vicuna-7b-v1.3",
     "vicuna-13b-v1.3": "lmsys/vicuna-13b-v1.3",
+    "yi-6b": "zero-one-ai/Yi-6B",
+    "yi-34b": "zero-one-ai/Yi-34B",
 }
 """Together model name aliases.
 
 HELM users use a shorter model name (e.g. together/flan-t5-xxl)
 whereas the Together client sends and caches requests using
 a longer model name that is suffixed with the implementation framework
-(e.g. flan-t5-xxl-hf). This allows trackcing exactly which
+(e.g. flan-t5-xxl-hf). This allows tracking exactly which
 implementation was used in the cached results, since some results may
 be different depending on the implementation (e.g. efficiency metrics).
 This also allows future migration of results in the case of changes of
@@ -109,6 +109,10 @@ The keys are the model engine of the HELM model name (e.g. "alpaca-7b"), not the
 (e.g. "stanford/alpaca-7b") or the Together model name (e.g. "togethercomputer/alpaca-7b")."""
 
 
+TOGETHER_SUPPORTS_ASYNC_REQUESTS = False
+"""Whether Together AI currently supports asynchronous requests."""
+
+
 def _rewrite_raw_request_for_model_tags(raw_request: Dict[str, Any], model_engine: str) -> Dict[str, Any]:
     """Rewrite the raw request given the model."""
     # Make a deepcopy to avoid mutating the input in unexpected ways
@@ -141,7 +145,7 @@ class JobNotFinishedError(TogetherClientError):
     pass
 
 
-class TogetherClient(Client):
+class TogetherClient(CachingClient):
     """
     Client for the models where we evaluate offline. Since the queries are handled offline, the `TogetherClient` just
     checks if the request/result is cached. We return the result if it's in the cache. Otherwise, we return an error.
@@ -169,24 +173,23 @@ class TogetherClient(Client):
         return _rewrite_raw_request_for_model_tags(raw_request, request.model_engine)
 
     def __init__(self, cache_config: CacheConfig, api_key: Optional[str] = None):
+        super().__init__(cache_config=cache_config)
         # TODO: the endpoint currently doesn't require an API key. When an API key is not specified
         #       in credentials.conf, we rely on offline evaluation only.
         self.api_key: Optional[str] = api_key
-        self.cache = Cache(cache_config)
 
     def _get_job_url(self, job_id: str) -> str:
         return f"https://api.together.xyz/jobs/job/{job_id}"
 
     def make_request(self, request: Request) -> RequestResult:
         raw_request = TogetherClient.convert_to_raw_request(request)
-        cache_key: Dict = Client.make_cache_key(raw_request, request)
+        cache_key: Dict = CachingClient.make_cache_key(raw_request, request)
 
         if not self.api_key:
             raise TogetherClientError("togetherApiKey not set in credentials.conf")
         headers: Dict[str, str] = {"Authorization": f"Bearer {self.api_key}"}
 
-        # TODO: Remove synchronous branch.
-        if request.model_engine in MODEL_ALIASES:
+        if TOGETHER_SUPPORTS_ASYNC_REQUESTS:
 
             def submit_job() -> str:
                 submit_request = {**raw_request, "async": True}
@@ -329,9 +332,3 @@ class TogetherClient(Client):
                 completions=completions,
                 embedding=[],
             )
-
-    def tokenize(self, request: TokenizationRequest) -> TokenizationRequestResult:
-        raise NotImplementedError("Use the HuggingFaceClient to tokenize.")
-
-    def decode(self, request: DecodeRequest) -> DecodeRequestResult:
-        raise NotImplementedError("Use the HuggingFaceClient to decode.")

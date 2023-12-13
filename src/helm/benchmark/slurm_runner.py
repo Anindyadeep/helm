@@ -131,7 +131,7 @@ class SlurmRunner(Runner):
         # When running with multiple models, sorting by RunSpec.name is a heuristic that tries to
         # spread out the load evenly across multiple models, in order to avoid overloading any single model.
         for run_spec in sorted(run_specs, key=lambda run_spec: run_spec.name):
-            if self.skip_completed_runs and self._is_run_completed(run_spec):
+            if self.skip_completed_runs and self._is_run_completed(self._get_run_path(run_spec)):
                 skipped_run_specs.append(run_spec)
             else:
                 queued_run_specs.append(run_spec)
@@ -150,6 +150,9 @@ class SlurmRunner(Runner):
         # Info for all worker Slurm jobs
         run_name_to_slurm_job_info: Dict[str, _SlurmJobInfo] = {}
 
+        # Location to persist the info for all worker Slurm jobs
+        worker_slurm_jobs_path = os.path.join(self.slurm_base_dir, "worker_slurm_jobs.json")
+
         # Callback for cleaning up worker Slurm jobs
         def cancel_all_jobs():
             """Cancels all submitted worker Slurm jobs that are in a non-terminal state."""
@@ -159,6 +162,11 @@ class SlurmRunner(Runner):
                     if slurm_job_info.state not in TERMINAL_SLURM_JOB_STATES:
                         hlog(f"Cancelling worker Slurm job run {run_name} with Slurm job ID {slurm_job_info.id}")
                         cancel_slurm_job(slurm_job_info.id)
+                        slurm_job_info.state = SlurmJobState.CANCELLED
+            run_name_to_slurm_job_info_json = to_json(run_name_to_slurm_job_info)
+            hlog(f"Worker Slurm jobs: {run_name_to_slurm_job_info_json}")
+            hlog(f"Writing worker Slurm job states to {worker_slurm_jobs_path}")
+            write(file_path=worker_slurm_jobs_path, content=run_name_to_slurm_job_info_json)
 
         try:
             # Monitor submitted Slurm jobs for RunSpecs until an exit condition is triggered.
@@ -190,7 +198,6 @@ class SlurmRunner(Runner):
                     for slurm_job_info in run_name_to_slurm_job_info.values():
                         if slurm_job_info.state not in TERMINAL_SLURM_JOB_STATES:
                             slurm_job_info.state = get_slurm_job_state(slurm_job_info.id)
-                    worker_slurm_jobs_path = os.path.join(self.slurm_base_dir, "worker_slurm_jobs.json")
                     run_name_to_slurm_job_info_json = to_json(run_name_to_slurm_job_info)
                     hlog(f"Worker Slurm jobs: {run_name_to_slurm_job_info_json}")
                     hlog(f"Writing worker Slurm job states to {worker_slurm_jobs_path}")

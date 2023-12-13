@@ -26,6 +26,9 @@ class AdapterSpec:
     # For example, it is recommended to prefix all prompts with [NLG] for UL2.
     global_prefix: str = ""
 
+    # Append all prompts with this string.
+    global_suffix: str = ""
+
     # Prompt starts with instructions
     instructions: str = ""
 
@@ -73,7 +76,11 @@ class AdapterSpec:
 
     # Decoding parameters (inherited by `Request`)
 
-    # Model to make the request to (need to fill in)
+    # Model deployment to make the request to (need to fill in)
+    model_deployment: str = ""
+
+    # DEPRECATED: old model field, kept for backward compatibility
+    # TODO: Remove this once we do not wish to support backward compatibility anymore.
     model: str = ""
 
     # Temperature to use

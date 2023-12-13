@@ -2,6 +2,7 @@ from typing import Dict, List, Union, Optional
 import string
 import dataclasses
 
+from helm.benchmark.run_specs import get_default_model_deployment_for_model
 from helm.common.critique_request import (
     CritiqueRequest,
     CritiqueRequestResult,
@@ -15,11 +16,6 @@ from helm.common.request import Request, RequestResult, Sequence
 from helm.proxy.clients.client import Client
 from helm.proxy.critique.critique_client import CritiqueClient
 
-try:
-    import anthropic
-except ModuleNotFoundError as e:
-    handle_module_not_found_error(e)
-
 
 class CritiqueParseError(Exception):
     pass
@@ -31,6 +27,10 @@ class ModelCritiqueClient(CritiqueClient):
     def __init__(self, client: Client, model_name):
         self._client = client
         self._model_name = model_name
+        self._model_deployment_name = (
+            get_default_model_deployment_for_model(model_name, warn_arg_deprecated=False, ignore_deprecated=True)
+            or self._model_name
+        )
 
     def _interpolate_fields(self, text: str, fields: Dict[str, str]) -> str:
         for key, value in fields.items():
@@ -71,10 +71,16 @@ class ModelCritiqueClient(CritiqueClient):
             # Special case for Anthropic to handle prefix and suffix.
             # TODO(josselin): Fix this once refactor of HELM allows for automatic model prefix and suffix.
             if self._model_name.startswith("anthropic"):
+                try:
+                    import anthropic
+                except ModuleNotFoundError as e:
+                    handle_module_not_found_error(e, ["anthropic"])
+
                 prompt = anthropic.HUMAN_PROMPT + prompt + anthropic.AI_PROMPT
 
             request = Request(
                 model=self._model_name,
+                model_deployment=self._model_deployment_name,
                 prompt=prompt,
                 max_tokens=max_tokens,
                 echo_prompt=False,

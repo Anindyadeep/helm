@@ -5,10 +5,10 @@ from urllib.parse import unquote
 from functools import partial
 
 import json
-import re
 import string
 import nltk
 import numpy as np
+import re
 import scipy
 import calibration as cal
 import importlib_resources as resources
@@ -32,11 +32,11 @@ from helm.benchmark.window_services.tokenizer_service import TokenizerService
 from helm.benchmark.scenarios.scenario import CORRECT_TAG, Instance, Reference
 from helm.benchmark.scenarios.math_scenario import is_equiv, is_equiv_chain_of_thought
 from helm.benchmark.scenarios.code_scenario import CodeReference
+from helm.benchmark.metrics.cleva_metrics_helper import ChineseTokenizer
 from . import code_metrics_helper
 from .metric import Metric, get_unique_stat_by_name
 from .metric_name import MetricName
 from .metric_service import MetricService
-from .cleva_harms_metrics import ChineseTokenizer
 from .statistic import Stat
 
 
@@ -60,8 +60,8 @@ def compute_estimated_time_from_prompt_size_and_num_output_tokens(
     num_output_tokens: int,
 ) -> Optional[float]:
     estimated_runtime: Optional[float]
-    if request_state.request.model in inference_runtimes_dict:
-        inference_runtimes_dict_for_model = inference_runtimes_dict[request_state.request.model]
+    if request_state.request.model_deployment in inference_runtimes_dict:
+        inference_runtimes_dict_for_model = inference_runtimes_dict[request_state.request.model_deployment]
         runtime_per_output_token: float = inference_runtimes_dict_for_model["runtime_per_output_token"]
         raw_runtimes_for_prompt_tokens: Dict[str, float] = inference_runtimes_dict_for_model[
             "runtime_for_prompt_tokens"
@@ -202,6 +202,25 @@ def exact_match_indicator(gold: str, pred: str, indicator: str = " ") -> float:
     return exact_match(gold, pred)
 
 
+def final_number_exact_match(gold: str, pred: str) -> float:
+    """
+    Returns 1 iff the final number in gold and pred match.
+    Similar to exact_match_indicator.
+    Example:
+    - gold = "The answer is 15."
+    - pred = "The answer is 15 eggs."
+    - Returns 1
+    """
+
+    def get_final_number(x: str) -> str:
+        matches = re.findall(r"-?[\d,]+(?:.\d+)?", x)
+        if not matches:
+            return ""
+        return matches[-1].replace(",", "")
+
+    return exact_match(get_final_number(gold), get_final_number(pred))
+
+
 def get_num_bytes(tokens: List[Token]) -> int:
     """
     Compute the byte length of the input tokens. For a UTF-8 string token, we use byte() to convert
@@ -266,12 +285,12 @@ def bleu_1(gold: str, pred: str) -> float:
 
 
 def chinese_bleu_1(gold: str, pred: str) -> float:
-    char_tokenizer = ChineseTokenizer(method="char")
+    char_tokenizer = ChineseTokenizer()
     return sentence_bleu([char_tokenizer.tokenize(gold)], char_tokenizer.tokenize(pred), weights=(1, 0, 0, 0))
 
 
 def get_chinese_rouge_function(rouge_type: str) -> Callable[[str, str], float]:
-    char_tokenizer = ChineseTokenizer(method="char")
+    char_tokenizer = ChineseTokenizer()
     scorer = rouge_scorer.RougeScorer([rouge_type], use_stemmer=True, tokenizer=char_tokenizer)
     return partial(rouge_score, scorer=scorer, rouge_type=rouge_type)
 
@@ -497,6 +516,7 @@ class BasicMetric(Metric):
             "prefix_exact_match": prefix_exact_match,
             "quasi_prefix_exact_match": quasi_prefix_exact_match,
             "exact_match_indicator": exact_match_indicator,
+            "final_number_exact_match": final_number_exact_match,
             "exact_set_match": exact_set_match,
             "iou_set_match": iou_set_match,
             "f1_set_match": f1_set_match,
@@ -583,7 +603,9 @@ class BasicMetric(Metric):
         # Fetch the right `Tokenizer` depending on the model defined in `AdapterSpec`
         # and calculate the number of tokens in the prompt.
         tokenizer_service: TokenizerService = metric_service
-        window_service: WindowService = WindowServiceFactory.get_window_service(adapter_spec.model, tokenizer_service)
+        window_service: WindowService = WindowServiceFactory.get_window_service(
+            adapter_spec.model_deployment, tokenizer_service
+        )
         prompt: str = request_state.request.prompt
         num_prompt_tokens: int = window_service.get_num_tokens(prompt)
 
@@ -618,14 +640,16 @@ class BasicMetric(Metric):
 
         # Compute efficiency metrics for training.
         training_co2_cost: Optional[float]
-        if request_state.request.model in self.training_efficiency_dict["carbon"]:
-            training_co2_cost = self.training_efficiency_dict["carbon"][request_state.request.model]["value"]
+        if request_state.request.model_deployment in self.training_efficiency_dict["carbon"]:
+            training_co2_cost = self.training_efficiency_dict["carbon"][request_state.request.model_deployment]["value"]
         else:
             training_co2_cost = None
 
         training_energy_cost: Optional[float]
-        if request_state.request.model in self.training_efficiency_dict["energy"]:
-            training_energy_cost = self.training_efficiency_dict["energy"][request_state.request.model]["value"]
+        if request_state.request.model_deployment in self.training_efficiency_dict["energy"]:
+            training_energy_cost = self.training_efficiency_dict["energy"][request_state.request.model_deployment][
+                "value"
+            ]
         else:
             training_energy_cost = None
 
@@ -799,7 +823,9 @@ class BasicMetric(Metric):
         num_choices = len(references)
 
         tokenizer_service: TokenizerService = metric_service
-        window_service: WindowService = WindowServiceFactory.get_window_service(adapter_spec.model, tokenizer_service)
+        window_service: WindowService = WindowServiceFactory.get_window_service(
+            adapter_spec.model_deployment, tokenizer_service
+        )
         reference_stats: Dict[ReferenceKey, ReferenceStat] = {}
         for request_state in reference_request_states:
             assert request_state.reference_index is not None and request_state.request_mode is not None
